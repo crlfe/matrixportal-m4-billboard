@@ -181,10 +181,12 @@ class HttpServerConnection {
     unsigned long now = millis();
     if (sock) {
       if (now - last_begin > 15000) {
-        Serial.print("http connection timeout\n");
+        Serial.printf("http connection timeout (body=%ld)\n",
+                      (long)dataLen - (long)dataPos);
         state = STATE_CLOSE;
       } else if (now - last_progress > 1000) {
-        Serial.print("http connection idle timeout\n");
+        Serial.printf("http connection idle timeout (body=%ld)\n",
+                      (long)dataLen - (long)dataPos);
         state = STATE_CLOSE;
       }
     }
@@ -228,16 +230,17 @@ class HttpServerConnection {
         }
       }
     } else if (state == STATE_READING_BODY) {
-      int n = sock.available()
-                  ? sock.read(data + dataLen, sizeof(data) - dataLen)
-                  : 0;
+      int avail = sock.available();
+      int n =
+          avail > 0 ? sock.read(data + dataLen, min((size_t)avail, sizeof(data) - dataLen))
+                : 0;
       if (n <= 0) {
         return;
       }
       last_progress = now;
 
       dataLen += n;
-      if (dataLen >= contentLength) {
+      if (dataLen > dataPos && dataLen - dataPos >= contentLength) {
         state = processBodyDone();
       }
     } else if (state == STATE_WRITING_REPLY) {
@@ -375,6 +378,8 @@ class HttpServerConnection {
     if (!method || !resource || !version || strcmp(method, "PUT") != 0 ||
         strcmp(resource, "/image.bin") != 0 ||
         dataPos + sizeof(image_bin) > dataLen) {
+      Serial.printf("http PUT image.bin failed (contentLength=%ld, body=%ld)\n",
+                    (long)contentLength, (long)dataLen - (long)dataPos);
       return sendReplyStatus(500, "Internal Server Error", "");
     }
     memcpy(image_bin, data + dataPos, sizeof(image_bin));
@@ -385,6 +390,7 @@ class HttpServerConnection {
     if (file) {
       file.write(image_bin, sizeof(image_bin));
       if (!file.close()) {
+        Serial.print("http PUT image.bin failed write\n");
         return sendReplyStatus(500, "Internal Server Error", "");
       }
     }
@@ -578,12 +584,14 @@ void loop() {
     File32 file = flash_fat.open("/image.bin", O_BINARY | O_RDONLY);
     if (file.size() == sizeof(image_bin)) {
       file.readBytes((uint8_t*)image_bin, sizeof(image_bin));
-
-      // Always display the newly-loaded image for a while.
-      image_show = true;
-      last_image_show = millis();
+    } else {
+      bzero(image_bin, sizeof(image_bin));
     }
     file.close();
+
+    // Always display the newly-loaded image for a while.
+    image_show = true;
+    last_image_show = millis();
   }
 
   // Throttle polling the ESP32 to once every 50ms.
