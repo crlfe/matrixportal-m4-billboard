@@ -32,7 +32,8 @@ function imageToRGB565le(src: ImageData, gamma: (x: number) => number) {
 }
 
 function imageFromRGB565le(src: DataView) {
-  const dst = new Uint8ClampedArray(4 * WIDTH * HEIGHT);
+  const image = new ImageData(WIDTH, HEIGHT);
+  const dst = image.data;
   for (let y = 0; y < HEIGHT; y++) {
     for (let x = 0; x < WIDTH; x++) {
       const i = y * WIDTH + x;
@@ -44,7 +45,7 @@ function imageFromRGB565le(src: DataView) {
       dst[4 * i + 3] = 0xff;
     }
   }
-  return dst;
+  return image;
 }
 
 const picker = assertNotNull(
@@ -57,13 +58,6 @@ const preview = assertNotNull(
   document.getElementById("preview"),
 ) as HTMLCanvasElement;
 
-assertNotNull(document.getElementById("reset")).addEventListener(
-  "click",
-  () => {
-    const g = assertNotNull(preview.getContext("2d"));
-    g.clearRect(0, 0, WIDTH, HEIGHT);
-  },
-);
 assertNotNull(document.getElementById("submit")).addEventListener(
   "click",
   async (event) => {
@@ -96,7 +90,9 @@ const GAMMA_LUT = [
 
 async function updatePreview() {
   /** @type {CanvasRenderingContext2D} */
-  const g = assertNotNull(preview.getContext("2d"));
+  const g = assertNotNull(
+    preview.getContext("2d", { willReadFrequently: true }),
+  );
   const files = picker.files;
   if (!files || files.length != 1) {
     g.clearRect(0, 0, WIDTH, HEIGHT);
@@ -130,6 +126,9 @@ async function updatePreview() {
     } as any),
     (x) => GAMMA_LUT[clamp(x * scale, 0, 255) | 0],
   );
+
+  g.clearRect(0, 0, WIDTH, HEIGHT);
+  g.putImageData(imageFromRGB565le(new DataView(encoded)), 0, 0);
 
   return encoded;
 }
