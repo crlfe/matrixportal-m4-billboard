@@ -103,7 +103,20 @@ async function updatePreview() {
     return;
   }
 
-  const original = await createImageBitmap(files[0], {
+  // createImageBitmap can not read SVG images directly from the Blob,
+  // so we load everything into a HTML Image object first.
+  const url = URL.createObjectURL(files[0]);
+  const imageObject = new Image();
+  const imageLoaded = new Promise<Event>((resolve, reject) => {
+    imageObject.onload = resolve;
+    imageObject.onerror = reject;
+  });
+  imageObject.src = url;
+  await imageLoaded.finally(() => {
+    URL.revokeObjectURL(url);
+  });
+
+  const original = await createImageBitmap(imageObject, {
     resizeWidth: WIDTH,
     resizeHeight: HEIGHT,
   });
