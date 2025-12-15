@@ -3,63 +3,54 @@
 
 #include <Arduino.h>
 
-class Base64Encoder
-{
-  public:
-    Base64Encoder(String &dst) : dst(dst)
-    {
+class Base64Encoder : public Print {
+ public:
+  Base64Encoder(String& dst) : dst_(dst) {}
+
+  ~Base64Encoder() {
+    // The Base64Encoder is tiny, so will often be a short-lived
+    // stack-allocated object while part of a message is being formatted.
+    // To avoid the common (and hard to debug) mistake of forgetting to flush
+    // the last few characters, we automatically flush when destroyed.
+    flush();
+  }
+
+  virtual size_t write(uint8_t x) override {
+    buf_[pos_++] = x;
+    if (pos_ == sizeof(buf_)) {
+      flush();
+    }
+    return 1;
+  }
+
+  virtual void flush() override {
+    static const char BASE64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+        "+/";
+
+    if (pos_ > 0) {
+      char output[] = {
+          BASE64[63u & (buf_[0] >> 2)],
+          BASE64[63u & ((buf_[0] << 4) | (buf_[1] >> 4))],
+          pos_ > 0 ? BASE64[63u & ((buf_[1] << 2) | (buf_[2] >> 6))] : '=',
+          pos_ > 1 ? BASE64[63u & buf_[2]] : '=', '\0'};
+
+      if (!dst_.concat(output)) {
+        setWriteError();
+      }
     }
 
-    ~Base64Encoder()
-    {
-        flush();
-    }
+    bzero(buf_, sizeof(buf_));
+    pos_ = 0;
+  }
 
-    void putc(int x)
-    {
-        buf[pos++] = (uint8_t)x;
-        if (pos == sizeof(buf))
-        {
-            flush();
-        }
-    }
+ private:
+  String& dst_;
 
-    void puts(const char *str)
-    {
-        if (str)
-        {
-            for (const char *p = str; *p; p++)
-            {
-                putc(*p);
-            }
-        }
-    }
-
-    void flush()
-    {
-        // Array has 65 elements because it includes the trailing NUL.
-        static const char BASE64[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                       "abcdefghijklmnopqrstuvwxyz"
-                                       "0123456789"
-                                       "+/";
-
-        if (pos > 0)
-        {
-            dst += BASE64[63u & (buf[0] >> 2)];
-            dst += BASE64[63u & ((buf[0] << 4) | (buf[1] >> 4))];
-            dst += pos > 0 ? BASE64[63u & ((buf[1] << 2) | (buf[2] >> 6))] : '=';
-            dst += pos > 1 ? BASE64[63u & buf[2]] : '=';
-        }
-
-        bzero(buf, sizeof(buf));
-        pos = 0;
-    }
-
-  private:
-    String &dst;
-
-    uint8_t buf[3];
-    size_t pos = 0;
+  uint8_t buf_[3];
+  size_t pos_ = 0;
 };
 
-#endif // BASE64ENCODER_HH_
+#endif  // BASE64ENCODER_HH_

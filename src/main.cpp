@@ -15,16 +15,50 @@
 #include <utility/wifi_drv.h>
 
 #include "Base64Encoder.hh"
+#include "FixedBuffer.hh"
+
 #include "gen-site.h"
+
+// *** JSON configuration ***
+
+JsonDocument config_json;
+JsonDocument frames_json;
+
+bool frames_saving = false;
+unsigned long frames_saving_stamp = 0;
+
+static float getRequestedGain() {
+  return frames_json["gain"].is<float>() ? frames_json["gain"].as<float>()
+                                         : 0.5;
+}
+
+static int getRotation() {
+  return frames_json["rotation"].is<int>() ? frames_json["rotation"].as<int>()
+                                           : 0;
+}
+
+static int getMorning() {
+  return frames_json["morning"].is<int>() ? frames_json["morning"].as<int>()
+                                          : 900;
+}
+
+static int getEvening() {
+  return frames_json["evening"].is<int>() ? frames_json["evening"].as<int>()
+                                          : 1600;
+}
 
 // *** LED Matrix ***
 
 #define IMAGE_WIDTH (64)
 #define IMAGE_HEIGHT (64)
-uint16_t image_bin[IMAGE_HEIGHT * IMAGE_WIDTH];
+uint8_t image_bin[IMAGE_HEIGHT][IMAGE_WIDTH][4];
 
-bool image_show = false;
-unsigned long last_image_show = 0;
+bool image_saving = false;
+unsigned long image_saving_stamp = 0;
+
+bool image_showing = false;
+unsigned long image_showing_stamp = 0;
+unsigned long image_refresh_stamp = 0;
 
 // BUG: The Protomatter library requires the pin arrays to be non-const.
 Adafruit_Protomatter matrix(
@@ -41,27 +75,50 @@ Adafruit_Protomatter matrix(
     -2  // Two matrix panels in serpentine arrangement.
 );
 
-static void setup_matrix() {
+static void setupMatrix() {
   matrix.begin();
   matrix.fillScreen(0);
   matrix.show();
 }
 
-static void loop_matrix() {
+static void loopMatrix() {
   // DEBUG: Serial.printf("%lu: %d\n", millis(), (int)image_show);
-  if (image_show) {
-    matrix.drawRGBBitmap(0, 0, image_bin, 64, 64);
+  if (image_showing) {
+    // TODO: High gain when insifficiently powered (like over USB from a laptop)
+    // will cause voltage drop and system crashes. Consider always starting the
+    // actual gain at zero and slowly increasing until we hit the requested
+    // limit or see power ripples.
+    float gain = getRequestedGain();
+
+    // TODO: Automatic rotation based on the accelerometer would be cool.
+    // TODO: Consider using the DMA to scan out lines and avoid the sleep-based
+    // library.
+
+    int rotation = getRotation();
+    if (rotation == 90)
+      matrix.setRotation(1);
+    else if (rotation == 180)
+      matrix.setRotation(2);
+    else if (rotation == 270)
+      matrix.setRotation(3);
+    else
+      matrix.setRotation(0);
+
+    for (int y = 0; y < IMAGE_HEIGHT; y++) {
+      for (int x = 0; x < IMAGE_WIDTH; x++) {
+        const uint8_t* rgba = image_bin[y][x];
+        uint8_t r = constrain(rgba[0] * gain, 0, 255);
+        uint8_t g = constrain(rgba[1] * gain, 0, 255);
+        uint8_t b = constrain(rgba[2] * gain, 0, 255);
+        matrix.drawPixel(x, y, matrix.color565(r, g, b));
+      }
+    }
   } else {
     matrix.fillScreen(0);
   }
 
   matrix.show();
 }
-
-// *** JSON configuration ***
-
-JsonDocument config_json;
-JsonDocument frames_json;
 
 // *** SPI flash and USB mass storage device ***
 // <https://github.com/adafruit/Adafruit_TinyUSB_Arduino/blob/master/examples/MassStorage/msc_external_flash/msc_external_flash.ino>
@@ -76,17 +133,17 @@ unsigned long flash_changed_ms = 0;
 FatVolume flash_fat;
 bool flash_fat_ok = false;
 
-static int32_t flash_usb_read(uint32_t lba, void* buffer, uint32_t bufsize) {
+static int32_t flashUsbRead(uint32_t lba, void* buffer, uint32_t bufsize) {
   return flash.readBlocks(lba, (uint8_t*)buffer, bufsize / 512) ? bufsize : -1;
 }
 
-static int32_t flash_usb_write(uint32_t lba,
+static int32_t flashUsbWrite(uint32_t lba,
                                uint8_t* buffer,
                                uint32_t bufsize) {
   return flash.writeBlocks(lba, buffer, bufsize / 512) ? bufsize : -1;
 }
 
-static void flash_usb_flush() {
+static void flashUsbFlush() {
   flash.syncBlocks();
   flash_fat.cacheClear();
 
@@ -94,15 +151,17 @@ static void flash_usb_flush() {
   flash_changed_ms = millis();
 }
 
-static void setup_flash() {
+static void setupFlash() {
   if (!flash.begin()) {
-    // TODO
+    // TODO: Need a fatal error logger
+    while (true) {
+    }
   }
 
   flash_usb.setID("Adafruit", "External Flash", "1.0");
   flash_usb.setCapacity(flash.pageSize() * flash.numPages() / 512, 512);
-  flash_usb.setReadWriteCallback(flash_usb_read, flash_usb_write,
-                                 flash_usb_flush);
+  flash_usb.setReadWriteCallback(flashUsbRead, flashUsbWrite,
+                                 flashUsbFlush);
   flash_usb.setUnitReady(true);
   flash_usb.begin();
 
@@ -122,6 +181,20 @@ MDNS mdns(udp);
 WiFiServer http_server(80);
 String http_auth;
 
+static int getHoursMinutes() {
+  // TODO: Would be *really* nice to have automatic dawn and dusk values.
+
+  unsigned long seconds = wifi.getTime();
+  if (seconds > 0) {
+    time_t t = seconds;
+    tm td = {0};
+    if (gmtime_r(&t, &td)) {
+      return td.tm_hour * 100 + td.tm_min;
+    }
+  }
+  return -1;
+}
+
 class HttpServerConnection {
  public:
   enum State {
@@ -133,92 +206,82 @@ class HttpServerConnection {
   } state;
 
   WiFiClient sock;
-  unsigned long last_begin;
-  unsigned long last_progress;
+  unsigned long connection_begin_ms;
+  unsigned long connection_change_ms;
 
-  uint8_t data[16 * 1024];
-  size_t dataPos;
-  size_t dataLen;
+  FixedBuffer<20480> data;
 
   const char* method;
   const char* resource;
   const char* version;
   const char* authorization;
-  const char* contentType;
-  unsigned long contentLength;
+  const char* content_type;
+  unsigned long content_length;
 
-  const uint8_t* replyData;
-  size_t replyPos;
-  size_t replyLen;
+  const uint8_t* reply_data;
+  size_t reply_pos;
+  size_t reply_len;
 
   void clear() {
     state = STATE_READING_REQUEST;
     sock.stop();
-    last_begin = 0;
-    last_progress = 0;
-    bzero(data, sizeof(data));
-    dataPos = 0;
-    dataLen = 0;
+    connection_begin_ms = 0;
+    connection_change_ms = 0;
+    data.clear();
     method = NULL;
     resource = NULL;
     version = NULL;
     authorization = NULL;
-    contentType = NULL;
-    contentLength = 0;
-    replyData = NULL;
-    replyPos = 0;
-    replyLen = 0;
+    content_type = NULL;
+    content_length = 0;
+    reply_data = NULL;
+    reply_pos = 0;
+    reply_len = 0;
   }
 
   void begin(WiFiClient sock) {
     clear();
     this->sock = sock;
-    last_begin = last_progress = millis();
+    unsigned long now = millis();
+    connection_begin_ms = now;
+    connection_change_ms = now;
   }
 
   void run() {
     // Check timeouts.
     unsigned long now = millis();
     if (sock) {
-      if (now - last_begin > 15000) {
-        Serial.printf("http connection timeout (body=%ld)\n",
-                      (long)dataLen - (long)dataPos);
+      if (now - connection_begin_ms > 15000) {
+        Serial.printf("http connection timeout (body=%ld)\n", data.size());
         state = STATE_CLOSE;
-      } else if (now - last_progress > 1000) {
-        Serial.printf("http connection idle timeout (body=%ld)\n",
-                      (long)dataLen - (long)dataPos);
+      } else if (now - connection_change_ms > 1000) {
+        Serial.printf("http connection idle timeout (body=%ld)\n", data.size());
         state = STATE_CLOSE;
       }
     }
 
     if (state == STATE_READING_REQUEST || state == STATE_READING_HEADERS) {
-      int n = sock.available()
-                  ? sock.read(data + dataLen, sizeof(data) - dataLen)
-                  : 0;
+      int n = sock.available() ? sock.read(data.end(), data.remaining()) : 0;
       if (n <= 0) {
         return;
       }
-      last_progress = now;
+      data.advanceEnd(n);
+
+      connection_change_ms = now;
 
       // Scan the data for newlines, starting at the beginning of the latest
       // line.
-      dataLen += n;
-      for (size_t i = dataPos; i < dataLen;) {
-        n = matchNewline(i);
-        if (n <= 0) {
-          i++;
-          continue;
+      while (state == STATE_READING_REQUEST || state == STATE_READING_HEADERS) {
+        char* line = consumeLine();
+        if (!line) {
+          // Have not received a complete line yet, wait for more data.
+          break;
         }
-
-        char* line = (char*)data + dataPos;
-        data[i] = '\0';
-
-        dataPos = i + n;
-        i = dataPos;
+        // DEBUG: Serial.printf("line: %s\n", line);
 
         if (line[0] == '\0') {
-          // Found a blank line.
-          state = processRequestDone();
+          // Found a blank line, process the end of headers.
+          state = processHeadersDone();
           break;
         }
 
@@ -231,16 +294,15 @@ class HttpServerConnection {
       }
     } else if (state == STATE_READING_BODY) {
       int avail = sock.available();
-      int n =
-          avail > 0 ? sock.read(data + dataLen, min((size_t)avail, sizeof(data) - dataLen))
-                : 0;
-      if (n <= 0) {
-        return;
+      int n = avail > 0
+                  ? sock.read(data.end(), min((size_t)avail, data.remaining()))
+                  : 0;
+      if (n > 0) {
+        data.advanceEnd(n);
+        connection_change_ms = now;
       }
-      last_progress = now;
 
-      dataLen += n;
-      if (dataLen > dataPos && dataLen - dataPos >= contentLength) {
+      if (data.size() >= content_length || !data.remaining()) {
         state = processBodyDone();
       }
     } else if (state == STATE_WRITING_REPLY) {
@@ -248,14 +310,13 @@ class HttpServerConnection {
       // be unimplemented. For the moment, throttling our write to 1K buffers
       // seems to avoid problems.
       size_t n =
-          sock.write(replyData + replyPos, min(1024u, replyLen - replyPos));
-      if (n <= 0) {
-        return;
+          sock.write(reply_data + reply_pos, min(1024u, reply_len - reply_pos));
+      if (n > 0) {
+        connection_change_ms = now;
+        reply_pos += n;
       }
-      last_progress = now;
 
-      replyPos += n;
-      if (replyPos >= replyLen || !sock.connected()) {
+      if (reply_pos >= reply_len || !sock.connected()) {
         state = STATE_CLOSE;
       }
     } else if (state == STATE_CLOSE) {
@@ -264,17 +325,22 @@ class HttpServerConnection {
   }
 
  private:
-  int matchNewline(size_t i) const {
-    char a = i + 0 < dataLen ? data[i + 0] : '\0';
-    char b = i + 1 < dataLen ? data[i + 1] : '\0';
-
-    if (a == '\r' && b == '\n') {
-      return 2;
-    } else if (a == '\r' || a == '\n') {
-      return 1;
-    } else {
-      return 0;
+  char* consumeLine() {
+    char* saved = reinterpret_cast<char*>(data.begin());
+    for (size_t i = 0; i < data.size(); i++) {
+      char a = data.get(i + 0);
+      char b = data.get(i + 1);
+      if (a == '\r' && b == '\n') {
+        data.set(i, '\0');
+        data.advanceBegin(i + 2);
+        return saved;
+      } else if (a == '\r' || a == '\n') {
+        data.set(i, '\0');
+        data.advanceBegin(i + 1);
+        return saved;
+      }
     }
+    return nullptr;
   }
 
   State processRequestLine(char* line) {
@@ -313,14 +379,14 @@ class HttpServerConnection {
     }
 
     if (strcasecmp(p0, "Content-Type") == 0) {
-      contentType = p1;
+      content_type = p1;
     } else if (strcasecmp(p0, "Content-Length") == 0) {
       // Parse error is indicated by ULONG_MAX.
       unsigned long length = strtoul(p1, NULL, 10);
-      if (dataLen > sizeof(data) || length > sizeof(data) - dataLen) {
+      if (length > data.remaining()) {
         return sendReplyStatus(413, "Content Too Large", "");
       }
-      contentLength = length;
+      content_length = length;
     } else if (strcasecmp(p0, "Authorization") == 0) {
       authorization = p1;
     }
@@ -328,7 +394,10 @@ class HttpServerConnection {
     return STATE_READING_HEADERS;
   }
 
-  State processRequestDone() {
+  State processHeadersDone() {
+    // DEBUG: Serial.printf("HTTP request %s %s %s\n", method, resource,
+    // version);
+
     if (!method || !resource || !version) {
       return sendReplyStatus(400, "Bad Request", "");
     } else if (!authorization || !checkAuthorization(authorization)) {
@@ -336,10 +405,26 @@ class HttpServerConnection {
           401, "Unauthorized",
           "WWW-Authenticate: Basic realm=\"billboard\", charset=\"UTF-8\"\r\n");
     } else if (strcmp(method, "GET") == 0) {
-      if (strcmp(resource, "/image.bin") == 0) {
+      if (strcmp(resource, "/api/image") == 0) {
         return sendReplyData(200, "OK", "application/octet-stream",
-                             sizeof(image_bin), NULL,
-                             (const uint8_t*)image_bin);
+                             sizeof(image_bin), NULL, image_bin);
+      } else if (strcmp(resource, "/api/gain") == 0) {
+        JsonDocument message;
+        message["value"] = getRequestedGain();
+        return sendReplyJson(200, "OK", message);
+      } else if (strcmp(resource, "/api/rotation") == 0) {
+        JsonDocument message;
+        message["rotation"] = getRotation();
+        return sendReplyJson(200, "OK", message);
+      } else if (strcmp(resource, "/api/time") == 0) {
+        JsonDocument message;
+        message["morning"] = getMorning();
+        message["evening"] = getEvening();
+        return sendReplyJson(200, "OK", message);
+      } else if (strcmp(resource, "/api/now") == 0) {
+        JsonDocument message;
+        message["value"] = getHoursMinutes();
+        return sendReplyJson(200, "OK", message);
       }
 
       const site_entry* file = findSiteFile(resource);
@@ -365,8 +450,11 @@ class HttpServerConnection {
       } else {
         return sendReplyStatus(404, "Not Found", "");
       }
-    } else if (strcmp(method, "PUT") == 0 &&
-               strcmp(resource, "/image.bin") == 0) {
+    } else if (strcmp(method, "POST") == 0 &&
+               (strcmp(resource, "/api/image") == 0 ||
+                strcmp(resource, "/api/gain") == 0 ||
+                strcmp(resource, "/api/rotation") == 0 ||
+                strcmp(resource, "/api/time") == 0)) {
       return STATE_READING_BODY;
     } else {
       return sendReplyStatus(405, "Method Not Allowed", "");
@@ -374,43 +462,95 @@ class HttpServerConnection {
   }
 
   State processBodyDone() {
-    // Should only reach here if the client is uploading a new image.bin.
-    if (!method || !resource || !version || strcmp(method, "PUT") != 0 ||
-        strcmp(resource, "/image.bin") != 0 ||
-        dataPos + sizeof(image_bin) > dataLen) {
-      Serial.printf("http PUT image.bin failed (contentLength=%ld, body=%ld)\n",
-                    (long)contentLength, (long)dataLen - (long)dataPos);
-      return sendReplyStatus(500, "Internal Server Error", "");
-    }
-    memcpy(image_bin, data + dataPos, sizeof(image_bin));
+    const unsigned long now = millis();
 
-    // Overwrite the saved image file. TODO: Is the SPI flash slow enough that
-    // this need to be async?
-    File32 file = flash_fat.open("/image.bin", O_CREAT | O_TRUNC | O_WRONLY);
-    if (file) {
-      file.write(image_bin, sizeof(image_bin));
-      if (!file.close()) {
-        Serial.print("http PUT image.bin failed write\n");
+    if (!method || !resource || !version) {
+      return sendReplyStatus(400, "Bad Request", "");
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(resource, "/api/image") == 0) {
+      if (data.size() != sizeof(image_bin)) {
+        Serial.printf(
+            "http PUT image.bin failed (contentLength=%lu, body=%lu)\n",
+            content_length, data.size());
         return sendReplyStatus(500, "Internal Server Error", "");
       }
+
+      // DEBUG: Serial.printf("new upload at %lu\n", millis());
+
+      memcpy(image_bin, data.begin(), sizeof(image_bin));
+
+      // Save the image if we make it through the next while without crashing.
+      image_saving = true;
+      image_saving_stamp = now;
+
+      // Always display the newly-updated image for a while.
+      image_showing = true;
+      image_showing_stamp = now;
+      image_refresh_stamp = now - 60000u;  // Refresh immediately.
+
+      return sendReplyStatus(200, "OK", "");
     }
 
-    // DEBUG: Serial.printf("new upload at %lu\n", millis());
+    if (strcmp(method, "POST") == 0 &&
+        (strcmp(resource, "/api/gain") == 0 ||
+         strcmp(resource, "/api/rotation") == 0 ||
+         strcmp(resource, "/api/time") == 0)) {
+      bool is_gain = resource[5] == 'g';
+      bool is_rotation = resource[5] == 'r';
 
-    // Always display the newly-updated image for a while.
-    image_show = true;
-    last_image_show = millis();
+      // Ensure the content is NUL-terminated for the JSON parser.
+      data.print('\0');
 
-    return sendReplyStatus(200, "OK", "");
+      JsonDocument message;
+      auto err = deserializeJson(message, data.begin());
+      if (err) {
+        return sendReplyStatus(500, "Internal Server Error", "");
+      }
+
+      if (is_gain) {
+        float value = constrain(message["value"].as<float>(), 0.0, 1.0);
+        frames_json["gain"] = value;
+      } else if (is_rotation) {
+        frames_json["rotation"] = message["value"].as<int>();
+      } else {
+        if (message["morning"].is<int>()) {
+          frames_json["morning"] = message["morning"].as<int>();
+        }
+        if (message["evening"].is<int>()) {
+          frames_json["evening"] = message["evening"].as<int>();
+        }
+      }
+
+      frames_saving = true;
+      frames_saving_stamp = millis();
+
+      // Always display the newly-updated image for a while.
+      image_showing = true;
+      image_showing_stamp = now;
+      image_refresh_stamp = now;
+
+      // Apply the changed setting immediately.
+      if (is_gain || is_rotation) {
+        image_refresh_stamp -= 60000;
+      } else {
+        image_showing_stamp -= 60000;
+      }
+
+      return sendReplyStatus(200, "OK", "");
+    }
+
+    // Should have rejected this at the end of the headers.
+    return sendReplyStatus(500, "Internal Server Error", "");
   }
 
   bool checkAuthorization(const char* auth) {
     String expect("Basic ");
     {
       Base64Encoder encoder(expect);
-      encoder.puts(config_json["http"]["user"]);
-      encoder.putc(':');
-      encoder.puts(config_json["http"]["pass"]);
+      encoder.print(config_json["http"]["user"].as<const char*>());
+      encoder.print(':');
+      encoder.print(config_json["http"]["pass"].as<const char*>());
     }
     return expect == auth;
   }
@@ -429,66 +569,110 @@ class HttpServerConnection {
                       const char* type,
                       const size_t length,
                       const char* encoding,
-                      const uint8_t* body) {
-    static const char* kFormat =
-        "HTTP/1.1 %d %s\r\n"
-        "Connection: close\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %lu\r\n"
-        "%s%s%s"  // Possible Content-Encoding header
-        "\r\n";
-
-    size_t cap = sizeof(data) - dataLen;
-    int n = snprintf((char*)data + dataLen, cap, kFormat, code, title, type,
-                     length, encoding ? "Content-Encoding: " : "",
-                     encoding ? encoding : "", encoding ? "\r\n" : "");
-    if (n <= 0 || (size_t)n >= cap || (size_t)n + length >= cap) {
-      return sendReplyStatus(500, "Internal Server Error", "");
+                      const void* body) {
+    data.advanceBegin(data.size());
+    data.print("HTTP/1.1 ");
+    data.print(code);
+    data.print(" ");
+    data.print(title);
+    data.print("\r\nConnection: close\r\nContent-Type: ");
+    data.print(type);
+    data.print("\r\nContent-Length: ");
+    data.print(length);
+    if (encoding) {
+      data.print("\r\nContent-Encoding: ");
+      data.print(encoding);
     }
-    memcpy(data + dataLen + n, body, length);
-    replyData = data + dataLen;
-    replyPos = 0;
-    replyLen = n + length;
+    data.print("\r\n\r\n");
+    data.write(reinterpret_cast<const uint8_t*>(body), length);
+    // TODO: Check for errors.
+
+    reply_data = data.begin();
+    reply_pos = 0;
+    reply_len = data.size();
+    return STATE_WRITING_REPLY;
+  }
+
+  State sendReplyJson(int code,
+                      const char* title,
+                      const JsonDocument& content) {
+    data.advanceBegin(data.size());
+    data.print("HTTP/1.1 ");
+    data.print(code);
+    data.print(" ");
+    data.print(title);
+    data.print(
+        "\r\nConnection: close"
+        "\r\nContent-Type: application/json"
+        "\r\nContent-Length: ");
+    // Reserve six characters for the length, to be filled later.
+    char* content_length_buffer = reinterpret_cast<char*>(data.end());
+    data.print("      \r\n\r\n");
+
+    size_t content_start = data.size();
+    serializeJson(content, data);
+    size_t content_size = data.size() - content_start;
+
+    // TODO: Unhack this!
+    ultoa(content_size, content_length_buffer, 10);
+    char* content_length_end = strchr(content_length_buffer, '\0');
+    if (content_length_end) {
+      *content_length_end = ' ';
+    }
+
+    reply_data = data.begin();
+    reply_pos = 0;
+    reply_len = data.size();
     return STATE_WRITING_REPLY;
   }
 
   State sendReplyStatus(int code,
                         const char* title,
                         const char* extra_headers) {
-    static const char* kFormat =
-        "HTTP/1.1 %d %s\r\n"
+    data.advanceBegin(data.size());
+    data.print("HTTP/1.1 ");
+    data.print(code);
+    data.print(" ");
+    data.print(title);
+    data.print(
+        "\r\n"
         "Connection: close\r\n"
         "Content-Type: text/plain\r\n"
-        "Content-Length: %d\r\n"
-        "%s"
-        "\r\n"
-        "%s\r\n";
-    int n = snprintf((char*)data, sizeof(data), kFormat, code, title,
-                     strlen(title) + 2, extra_headers, title);
-    replyData = data;
-    replyPos = 0;
-    replyLen = n > 0 && (size_t)n < sizeof(data) ? n : 0;
+        "Content-Length: ");
+    data.print(strlen(title) + 2);
+    data.print("\r\n");
+    data.print(extra_headers);
+    data.print("\r\n");
+    data.print(title);
+    data.print("\r\n");
+    // TODO: Check for errors.
+
+    reply_data = data.begin();
+    reply_pos = 0;
+    reply_len = data.size();
     return STATE_WRITING_REPLY;
   }
+};
 
-} http_connection;
+HttpServerConnection http_connection;
 
-static void loop_wifi() {
+static void loopWifi() {
   static enum {
     STATE_IDLE,
     STATE_CONNECTING,
     STATE_CONNECTED
   } state = STATE_IDLE;
-  static unsigned long state_change_ms;
+  static unsigned long state_change_ms = millis() - 60000;
 
   int status = WiFiDrv::getConnectionStatus();
   if (status != WL_CONNECTED) {
     // Retry the connection after thirty seconds.
     if (state != STATE_CONNECTING || status == WL_DISCONNECTED ||
-        (state == STATE_CONNECTING && millis() - state_change_ms > 30000)) {
+        (state == STATE_CONNECTING && millis() - state_change_ms > 10000)) {
       const JsonString& ssid = config_json["wifi"]["ssid"];
       const JsonString& pass = config_json["wifi"]["pass"];
       if (ssid && pass) {
+        Serial.printf("%lu: wifi connecting to %s\n", millis(), ssid.c_str());
         // This is the same operation run from wifi.begin(...), but that wrapper
         // may block for a long time waiting for the connection to succeed.
         WiFiDrv::wifiSetPassphrase(ssid.c_str(), ssid.size(), pass.c_str(),
@@ -503,6 +687,7 @@ static void loop_wifi() {
     }
   } else if (state != STATE_CONNECTED) {
     // Just connected to the network.
+    Serial.printf("%lu: wifi connected\n", millis());
     state = STATE_CONNECTED;
     state_change_ms = millis();
 
@@ -530,39 +715,32 @@ static void loop_wifi() {
 
 // *** Main Application ***
 
-static bool check_json_file(const char* path, JsonDocument* dst) {
+static bool checkJsonFile(const char* path, JsonDocument& dst) {
   bool changed = false;
 
   File32 file = flash_fat.open(path);
-  uint16_t mdate = 0, mtime = 0;
-  if (!file.getModifyDateTime(&mdate, &mtime) || mdate != (*dst)["_mdate"] ||
-      mtime != (*dst)["_mtime"]) {
-    changed = true;
-    deserializeJson(*dst, file);
-    (*dst)["_mdate"] = mdate;
-    (*dst)["_mtime"] = mtime;
+  if (file) {
+    uint16_t mdate = 0, mtime = 0;
+    if (!file.getModifyDateTime(&mdate, &mtime) || mdate != (dst)["_mdate"] ||
+        mtime != (dst)["_mtime"]) {
+      Serial.printf("%lu: loaded %s\n", millis(), path);
+      changed = true;
+      deserializeJson(dst, file);
+      (dst)["_mdate"] = mdate;
+      (dst)["_mtime"] = mtime;
+    } else {
+      Serial.printf("%lu: unchanged %s\n", millis(), path);
+    }
+  } else {
+    Serial.printf("%lu: failed %s\n", millis(), path);
   }
 
   return changed;
 }
 
-static int get_hours_minutes() {
-  // TODO: hard-coded UTC-4
-
-  unsigned long seconds = wifi.getTime();
-  if (seconds > 0) {
-    time_t t = seconds;
-    tm td = {0};
-    if (localtime_r(&t, &td)) {
-      return ((td.tm_hour + 20) % 24) * 100 + td.tm_min;
-    }
-  }
-  return -1;
-}
-
 void setup() {
-  setup_flash();
-  setup_matrix();
+  setupFlash();
+  setupMatrix();
 
   flash_changed_flag = true;
   flash_changed_ms = millis();
@@ -573,50 +751,98 @@ void loop() {
     flash_changed_flag = false;
     flash_changed_ms = 0;
 
+    // Changes to the flash override anything from the web server.
+    image_saving = false;
+
     if (!flash_fat_ok) {
       flash_fat_ok = flash_fat.begin(&flash);
     }
 
-    if (check_json_file("config.json", &config_json)) {
+    if (checkJsonFile("/config.json", config_json)) {
       wifi.disconnect();
     }
 
+    checkJsonFile("/frames.json", frames_json);
+
     File32 file = flash_fat.open("/image.bin", O_BINARY | O_RDONLY);
-    if (file.size() == sizeof(image_bin)) {
-      file.readBytes((uint8_t*)image_bin, sizeof(image_bin));
-    } else {
-      bzero(image_bin, sizeof(image_bin));
+    bzero(image_bin, sizeof(image_bin));
+    if (file) {
+      if (file.size() == sizeof(image_bin)) {
+        file.readBytes((uint8_t*)image_bin, sizeof(image_bin));
+      }
+      file.close();
     }
-    file.close();
 
     // Always display the newly-loaded image for a while.
-    image_show = true;
-    last_image_show = millis();
+    image_showing = true;
+    image_showing_stamp = millis();
   }
 
   // Throttle polling the ESP32 to once every 50ms.
   static unsigned long last_wifi = millis();
   if (millis() - last_wifi > 50) {
     last_wifi = millis();
-    loop_wifi();
+    loopWifi();
   }
 
   // Apply the time of day value every thirty seconds.
-  if (millis() - last_image_show > 30000) {
-    int hm = get_hours_minutes();
+  if (millis() - image_showing_stamp > 30000) {
+    int hm = getHoursMinutes();
     if (hm >= 0) {
-      image_show = (hm < 600 || hm > 2100);
-      last_image_show = millis();
+      int morning = getMorning();
+      int evening = getEvening();
+      if (morning < evening) {
+        image_showing = (hm <= morning || hm >= evening);
+      } else {
+        image_showing = (hm >= morning || hm <= evening);
+      }
+      image_showing_stamp = millis();
     }
   }
 
   // Throttle matrix refresh to once every second.
-  static unsigned long last_matrix = millis();
-  if (millis() - last_matrix > 1000) {
-    last_matrix = millis();
-    loop_matrix();
+  if (millis() - image_refresh_stamp > 1000) {
+    image_refresh_stamp = millis();
+    loopMatrix();
+  }
 
-    // Serial.printf("state %d %lu %lu\n", (int)http_connection.state,
-    // http_connection.replyPos, http_connection.replyLen);
+  if (image_saving && millis() - image_saving_stamp > 1000) {
+    image_saving = false;
+
+    File32 file = flash_fat.open("/image.bin", O_CREAT | O_TRUNC | O_WRONLY);
+    if (file) {
+      Serial.printf("%lu: writing /image.bin\n", millis());
+      file.write(image_bin, sizeof(image_bin));
+
+      if (!file.close()) {
+        Serial.printf("%lu: error flushing /image.bin\n", millis());
+      }
+    } else {
+      Serial.printf("%lu: error writing /image.bin\n", millis());
+    }
+  }
+
+  if (frames_saving && millis() - frames_saving_stamp > 1000) {
+    frames_saving = false;
+
+    File32 file;
+    if (file.open(&flash_fat, "frames.json", O_CREAT | O_TRUNC | O_WRONLY)) {
+      Serial.printf("%lu: writing frames.json\n", millis());
+      frames_json.remove("_mdate");
+      frames_json.remove("_mtime");
+
+      serializeJsonPretty(frames_json, file);
+
+      uint16_t mdate = 0, mtime = 0;
+      file.getModifyDateTime(&mdate, &mtime);
+      frames_json["_mdate"] = mdate;
+      frames_json["_mtime"] = mtime;
+
+      if (!file.close()) {
+        Serial.printf("%lu: error flushing frames.json\n", millis());
+      }
+    } else {
+      Serial.printf("%lu: error writing frames.json\n", millis());
+    }
   }
 }

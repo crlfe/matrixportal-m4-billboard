@@ -1,9 +1,9 @@
-import {defineConfig} from "vite";
+import { defineConfig } from "vite";
 
 export default defineConfig({
-    server: {
-      proxy: {
-        "/image.bin": "http://billboard.local"
-      }
-    }
+  server: {
+    proxy: {
+      "/api/": "http://billboard.local",
+    },
+  },
 });

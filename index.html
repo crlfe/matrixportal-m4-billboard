@@ -5,41 +5,70 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <script type="module" src="src/main"></script>
     <style>
-      div {
-        margin: 0.5em 0;
+      #app {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        grid: 1fr minmax(0, min-content) / 100%;
+        margin: 0.5em;
+        gap: 0.5em;
+      }
+      #display {
+        place-self: center;
+        display: block;
+        background-color: #000;
+        image-rendering: pixelated;
+        width: round(down, 80cqmin, 64px);
+        height: round(down, 80cqmin, 64px);
+      }
+      .hflex {
+        display: flex;
+        flex-direction: row;
+        gap: 0.5em;
       }
     </style>
   </head>
   <body>
-    <form>
-      <div><input id="file" type="file" accept="image/*" /></div>
-      <canvas
-        id="preview"
-        width="64"
-        height="64"
-        style="
-          grid-column: span 2;
-          display: block;
-          background-color: #000;
-          image-rendering: pixelated;
-          width: 640px;
-          height: 640px;
-        "
-      ></canvas>
-      <div>
-        <label for="intensity">Intensity</label>
+    <div id="app">
+      <canvas id="display" width="64" height="64"></canvas>
+      <button id="open-image">Open...</button>
+      <div class="hflex">
+        <label for="gain-range">Gain</label>
         <input
-          id="intensity"
+          id="gain-range"
           type="range"
-          value="0.5"
-          min="0.25"
-          max="2.0"
-          step="0.0625"
+          min="0"
+          max="100"
+          step="1"
+          value="25"
+          style="flex: 1"
+        />
+        <input
+          id="gain-number"
+          type="number"
+          min="0"
+          max="100"
+          step="1"
+          value="25"
         />
       </div>
       <div>
-        <input id="submit" type="submit" value="Upload" />
+        All times are in the local time using a 24-hour clock, as
+        <code>hmm</code> or <code>hhmm</code>.
       </div>
-    </form>
+      <div
+        class="hflex"
+        style="flex-wrap: wrap; gap: 2em; justify-content: space-between"
+      >
+        <div style="display: grid; grid: 1fr/6em 4em">
+          <label for="time-morning">Morning (off)</label>
+          <input id="time-morning" min="0" max="2359" step="1" value="800" />
+        </div>
+        <div style="display: grid; grid: 1fr/6em 4em">
+          <label for="time-evening">Evening (on)</label>
+          <input id="time-evening" min="0" max="2359" step="1" value="1800" />
+        </div>
+      </div>
+    </div>
   </body>
 </html>
