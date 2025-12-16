@@ -31,7 +31,10 @@
   <body>
     <div id="app">
       <canvas id="display" width="64" height="64"></canvas>
-      <button id="open-image">Open...</button>
+      <div class="hflex">
+        <button id="open-image" style="flex:1">Open...</button>
+        <button id="save-image" style="flex:1">Save...</button>
+      </div>
       <div class="hflex">
         <label for="gain-range">Gain</label>
         <input

@@ -32,9 +32,9 @@ const display = assertNotNull(
   document.getElementById("display"),
 ) as HTMLCanvasElement;
 
-const openImageButton = assertNotNull(
-  document.getElementById("open-image"),
-) as HTMLButtonElement;
+const [openImageButton, saveImageButton] = ["open-image", "save-image"].map(
+  (id) => assertNotNull(document.getElementById(id)) as HTMLButtonElement,
+);
 
 const [gainRange, gainNumber, timeMorning, timeEvening, timeZone] = [
   "gain-range",
@@ -65,7 +65,8 @@ openImageButton.addEventListener("click", () => {
       });
 
       const g = assertNotNull(display.getContext("2d"));
-      g.clearRect(0, 0, WIDTH, HEIGHT);
+      g.fillStyle = "#000";
+      g.fillRect(0, 0, WIDTH, HEIGHT);
       g.drawImage(imageObject, 0, 0, WIDTH, HEIGHT);
 
       postImageController?.abort();
@@ -79,6 +80,13 @@ openImageButton.addEventListener("click", () => {
     }
   });
   input.click();
+});
+
+saveImageButton.addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.setAttribute("href", display.toDataURL("image/png"));
+  link.setAttribute("download", "image.png");
+  link.click();
 });
 
 function coalesceFetch<Args extends unknown[]>(
@@ -143,9 +151,10 @@ fetch("/api/image")
   .then((res) => res.arrayBuffer())
   .then((buffer) => {
     const image = new ImageData(new Uint8ClampedArray(buffer), WIDTH, HEIGHT);
-    const g = display.getContext("2d");
-    g?.clearRect(0, 0, WIDTH, HEIGHT);
-    g?.putImageData(image, 0, 0);
+    const g = assertNotNull(display.getContext("2d"));
+    g.fillStyle = "#000";
+    g.fillRect(0, 0, WIDTH, HEIGHT);
+    g.putImageData(image, 0, 0);
   });
 
 fetch("/api/gain")
