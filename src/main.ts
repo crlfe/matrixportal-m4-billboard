@@ -13,19 +13,17 @@ function clamp(value: number, min: number, max: number) {
   return value < min ? min : value > max ? max : value;
 }
 
-function hmmToMins(hhmm: number): number {
-  return Math.floor(hhmm / 100) * 60 + (hhmm % 100);
+function hmmToMins(hmm: number): number {
+  return Math.floor(hmm / 100) * 60 + (hmm % 100);
 }
 
 function minsToHmm(mins: number): number {
   return Math.floor(mins / 60) * 100 + (mins % 60);
 }
 
-function addHmm(value: number, offset: number): number {
+function offsetHmm(hmm: number, deltaMinutes: number): number {
   // TODO: Check definition of JS % to see whether this can be simplified.
-  return minsToHmm(
-    (((hmmToMins(value) + hmmToMins(offset)) % 1440) + 1440) % 1440,
-  );
+  return minsToHmm((((hmmToMins(hmm) + deltaMinutes) % 1440) + 1440) % 1440);
 }
 
 const display = assertNotNull(
@@ -131,8 +129,8 @@ const postMorning = coalesceFetch("/api/time", (value: unknown) => ({
 }));
 
 timeMorning.addEventListener("change", () => {
-  const tz = new Date().getTimezoneOffset();
-  const morning = addHmm(parseInt(timeMorning.value, 10), tz);
+  const offset = new Date().getTimezoneOffset();
+  const morning = offsetHmm(parseInt(timeMorning.value, 10), offset);
   postMorning({ morning });
 });
 
@@ -142,8 +140,8 @@ const postEvening = coalesceFetch("/api/time", (value: unknown) => ({
 }));
 
 timeEvening.addEventListener("change", () => {
-  const tz = new Date().getTimezoneOffset();
-  const evening = addHmm(parseInt(timeEvening.value, 10), tz);
+  const offset = new Date().getTimezoneOffset();
+  const evening = offsetHmm(parseInt(timeEvening.value, 10), offset);
   postEvening({ evening });
 });
 
@@ -168,8 +166,7 @@ fetch("/api/gain")
 fetch("/api/time")
   .then((res) => res.json())
   .then((data) => {
-    const tz = new Date().getTimezoneOffset();
-
-    timeMorning.value = addHmm(Number(data.morning), -tz).toFixed(0);
-    timeEvening.value = addHmm(Number(data.evening), -tz).toFixed(0);
+    const offset = new Date().getTimezoneOffset();
+    timeMorning.value = offsetHmm(Number(data.morning), -offset).toFixed(0);
+    timeEvening.value = offsetHmm(Number(data.evening), -offset).toFixed(0);
   });
