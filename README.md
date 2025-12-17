@@ -1,8 +1,8 @@
 # MatrixPortal M4 Billboard
 
 The Adafruit MatrixPortal is a nifty Arduino-compatible board intended for
-driving RGB LED arrays. The M4 is a now-obsolete version that used both an
-ARM Cortex M4 processor (for application code) and an ESP32 WIFI processor
+driving RGB LED arrays. The M4 is an older version that uses both an
+ARM Cortex M4 processor (for application code) and an ESP32-WROOM-32E processor
 (for wifi).
 
 Unfortunately, using CircuitPython with my two 64x32 RGB LED arrays only
@@ -16,26 +16,30 @@ not great. Please consider it an example of something that someone hacked
 together and use for your inspiration, rather than trying to actually
 deploy it yourself.
 
-- Displays a 64x64 image from 9pm to 6am (UTC-4).
+- FAT32 filesystem is available over USB for initial configuration.
 - Connects to the local WiFi and serves a webapp for easy configuration.
-  - BUG: WiFi tends to disconnect and not recover; reset and wait a minute.
-- Filesystem is available over USB for configuration and to modify webapp.
-  - BUG: Writes tend to corrupt files; unmounting immediately seems to help.
+- Displays a static 64x64 image during the night.
 
-I'm not optimistic about being able to fix all of the problems without
-bringing the board up on a more complete RTOS
-([Zephyr](https://docs.zephyrproject.org/latest/introduction/index.html) is intriguing).
-However, with the MatrixPortal M4 being obsolete and unavailable, it seems
-a better use of my time to poke at other platforms.
+My impression has been that the MatrixPortal M4 was obsoleted by the newer and
+cheaper S3. However, Christmas of 2025 has the M4 back in stock everywhere
+and the S3 backordered. If that is still the case in early 2026, I may order
+another to experiment with DMA support, moving more functionality to the ESP32,
+and/or bringing up a proper RTOS ([Zephyr](https://docs.zephyrproject.org/latest/introduction/index.html) is intriguing).
+If not, it's probably because I found a different board that is similarly
+low-cost, low-profile, and can support more LEDs at once...
 
 ## Hardware
 
 **_Warning_**: The MatrixPortal must never be connected to both USB and a 5V power supply at the same time.
 
-- [Adafruit MatrixPortal M4 (obsolete)](https://www.adafruit.com/product/4745)
+- [Adafruit MatrixPortal M4](https://www.adafruit.com/product/4745)
 - 2x [Adafruit 64x32 RGB LED Matrix - 4mm pitch](https://www.adafruit.com/product/2278)
 - [Adafruit 5V 10A switching power supply](https://www.adafruit.com/product/658)
 - [Adafruit Female DC Power adapter - 2.1mm jack to screw terminal block](https://www.adafruit.com/product/368)
+
+The 'enclosure.scad' file contains the housing that I 3d printed to use with my
+particular hardware. Apparently the position of the screw holes on the LED panels
+has changed at least once, so be sure to check measurements against your hardware.
 
 ## Building
 
